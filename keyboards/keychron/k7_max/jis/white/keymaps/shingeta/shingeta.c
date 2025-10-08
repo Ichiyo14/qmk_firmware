@@ -364,7 +364,8 @@ bool shingeta_state(void) {
 void shingeta_mode(uint16_t keycode, keyrecord_t *record) {
     if (!is_shingeta) return;
 
-    static uint8_t n_modifier = 0;
+    static uint8_t n_modifier   = 0;
+    static bool    layer_was_on = false;
 
     switch (keycode) {
         case KC_LCTL:
@@ -376,12 +377,21 @@ void shingeta_mode(uint16_t keycode, keyrecord_t *record) {
         case KC_RALT:
         case KC_RGUI:
             if (record->event.pressed) {
+                if (n_modifier == 0) {
+                    // 最初のモディファイアが押された時だけレイヤーをオフ
+                    layer_was_on = IS_LAYER_ON(shingeta_layer);
+                    if (layer_was_on) {
+                        layer_off(shingeta_layer);
+                    }
+                }
                 n_modifier++;
-                layer_off(shingeta_layer);
             } else {
                 n_modifier--;
                 if (n_modifier == 0) {
-                    layer_on(shingeta_layer);
+                    // すべてのモディファイアが離された時にレイヤーを復元
+                    if (layer_was_on && is_shingeta) {
+                        layer_on(shingeta_layer);
+                    }
                 }
             }
             break;

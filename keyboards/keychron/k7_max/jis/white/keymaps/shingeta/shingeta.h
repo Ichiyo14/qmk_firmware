@@ -59,6 +59,9 @@ typedef enum shingeta_keycodes {
 // カスタムキーコード用
 enum custom_keycodes {
     NG_TOGGLE = NG_SAFE_RANGE, // 薙刀式トグルキー
+    NG_ON,                     // 薙刀式ON専用
+    NG_OFF,                    // 薙刀式OFF専用
+    NK_TOGGLE,
 };
 
 // 公開関数（keymap.cから呼び出される）
