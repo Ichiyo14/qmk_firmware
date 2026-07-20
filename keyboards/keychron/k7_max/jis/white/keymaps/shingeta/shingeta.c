@@ -1,40 +1,48 @@
+/* =========================================================================
+ * shingeta.c — 新下駄配列エンジン for QMK
+ *
+ * 同時押し（コンボ）判定つきのかな入力エンジン。
+ * COMBO_WINDOW 以内に2キー押されたら同時押し、超えたら単打として処理する。
+ *
+ * 公開API（shingeta.h）:
+ *   set_shingeta()       レイヤー番号の登録
+ *   shingeta_on/off()    ON/OFF（IME同期キー送信つき）
+ *   shingeta_force_on/off()  同上（互換用エイリアス）
+ *   shingeta_state()     現在の状態
+ *   shingeta_mode()      モディファイアキーの監視（レイヤー退避/復帰）
+ *   process_shingeta()   NGキーの入力処理本体
+ *   shingeta_timer_task() 単打確定タイマー（matrix_scan_userから呼ぶ）
+ * ========================================================================= */
+
 #include "shingeta.h"
 #include <string.h>
 
-#define NGBUFFER 5
-#define NG_KEY_COUNT 43
+/* ------------------------------------------------------------------------
+ * 設定
+ * --------------------------------------------------------------------- */
+#define NGBUFFER 5           // 入力バッファ長（同時押しは最大3キー想定）
+#define FIRST_OUTPUT_DELAY 50 // 単打確定までの待ち時間 [ms]
+#define COMBO_WINDOW 50       // 同時押し判定ウィンドウ [ms]
+
 #define NGMAP_SIZE (sizeof(ngmap) / sizeof(shingeta_keymap))
 
-#define FIRST_OUTPUT_DELAY 50
-#define REPEAT_DELAY 500
-#define REPEAT_INTERVAL 50
+/* ------------------------------------------------------------------------
+ * 状態
+ * --------------------------------------------------------------------- */
+static bool     is_shingeta    = false;      // エンジンON/OFF
+static uint8_t  shingeta_layer = 0;          // かなレイヤー番号
+static bool     layer_was_on   = false;      // モディファイア退避時のレイヤー状態
 
-// 内部関数の宣言
-static void shingeta_type(void);
-static void shingeta_type_repeat(void);
-static void shingeta_clear(void);
-static void save_combo_state(void);
-static bool find_and_send_kana(uint64_t combo);
+static uint16_t ninputs[NGBUFFER];           // 押されたNGキーコードの列
+static uint8_t  ng_chrcount    = 0;          // ninputsの要素数
+static uint64_t keycomb        = 0;          // 押下中キーのビットマスク（コンボ検索用）
 
-// 静的変数
-static uint8_t  ng_chrcount    = 0;
-static bool     is_shingeta    = false;
-static uint8_t  shingeta_layer = 0;
-static uint64_t keycomb        = (uint64_t)0;
+static uint16_t first_key_time = 0;          // 1打目の押下時刻
+static bool     timer_active   = false;      // 単打確定タイマーの有効フラグ
 
-// タイマーとリピート用の変数
-static uint16_t shingeta_timer     = 0;
-static bool     timer_active       = false;
-static uint16_t repeat_timer       = 0;
-static bool     combo_confirmed    = false;
-static uint64_t confirmed_keycomb  = 0;
-static uint8_t  confirmed_chrcount = 0;
-static uint16_t confirmed_inputs[NGBUFFER];
-
-// 文字入力バッファ
-static uint16_t ninputs[NGBUFFER];
-
-// 43キーを64bitの各ビットに割り当てる
+/* ------------------------------------------------------------------------
+ * キー → ビット対応（43キーを64bitに割り当て）
+ * --------------------------------------------------------------------- */
 #define B_Q ((uint64_t)1 << 0)
 #define B_W ((uint64_t)1 << 1)
 #define B_E ((uint64_t)1 << 2)
@@ -87,11 +95,13 @@ static uint16_t ninputs[NGBUFFER];
 
 #define B_SHFT ((uint64_t)1 << 42)
 
-// キーコードとキービットの対応
 const uint64_t ng_key[] = {
     [NG_Q - NG_Q] = B_Q, [NG_W - NG_Q] = B_W, [NG_E - NG_Q] = B_E, [NG_R - NG_Q] = B_R, [NG_T - NG_Q] = B_T, [NG_Y - NG_Q] = B_Y, [NG_U - NG_Q] = B_U, [NG_I - NG_Q] = B_I, [NG_O - NG_Q] = B_O, [NG_P - NG_Q] = B_P, [NG_A - NG_Q] = B_A, [NG_S - NG_Q] = B_S, [NG_D - NG_Q] = B_D, [NG_F - NG_Q] = B_F, [NG_G - NG_Q] = B_G, [NG_H - NG_Q] = B_H, [NG_J - NG_Q] = B_J, [NG_K - NG_Q] = B_K, [NG_L - NG_Q] = B_L, [NG_SCLN - NG_Q] = B_SCLN, [NG_Z - NG_Q] = B_Z, [NG_X - NG_Q] = B_X, [NG_C - NG_Q] = B_C, [NG_V - NG_Q] = B_V, [NG_B - NG_Q] = B_B, [NG_N - NG_Q] = B_N, [NG_M - NG_Q] = B_M, [NG_COMM - NG_Q] = B_COMM, [NG_DOT - NG_Q] = B_DOT, [NG_SLSH - NG_Q] = B_SLSH, [NG_1 - NG_Q] = BB_1, [NG_2 - NG_Q] = BB_2, [NG_3 - NG_Q] = BB_3, [NG_4 - NG_Q] = BB_4, [NG_5 - NG_Q] = BB_5, [NG_6 - NG_Q] = BB_6, [NG_7 - NG_Q] = BB_7, [NG_8 - NG_Q] = BB_8, [NG_9 - NG_Q] = BB_9, [NG_0 - NG_Q] = BB_0, [NG_MINS - NG_Q] = B_MINS, [NG_X1 - NG_Q] = B_X1, [NG_SHFT - NG_Q] = B_SHFT,
 };
 
+/* ------------------------------------------------------------------------
+ * かな定義テーブル
+ * --------------------------------------------------------------------- */
 typedef struct {
     uint64_t key;
     char     kana[5];
@@ -227,6 +237,7 @@ const PROGMEM shingeta_keymap ngmap[] = {
     {.key = B_L | BB_4, .kana = "myo"},
     {.key = B_L | BB_5, .kana = "xwa"},
 
+    // 拗音（+I）
     {.key = B_I | B_E, .kana = "sho"},
     {.key = B_I | B_W, .kana = "shu"},
     {.key = B_I | B_R, .kana = "kyu"},
@@ -245,6 +256,7 @@ const PROGMEM shingeta_keymap ngmap[] = {
     {.key = B_I | BB_3, .kana = "byu"},
     {.key = B_I | BB_4, .kana = "byo"},
 
+    // 拗音（+O）
     {.key = B_O | B_E, .kana = "jo"},
     {.key = B_O | B_W, .kana = "ju"},
     {.key = B_O | B_R, .kana = "gyu"},
@@ -263,110 +275,124 @@ const PROGMEM shingeta_keymap ngmap[] = {
     {.key = B_O | BB_3, .kana = "pyu"},
     {.key = B_O | BB_4, .kana = "pyo"},
 
-    // others
+    // その他の同時押し（記号）
     {.key = B_R | B_F, .kana = "/"},
     {.key = B_R | B_G, .kana = "/"},
-    {.key = B_F | B_G, .kana = "()" SS_TAP(X_LEFT)},
+    {.key = B_F | B_G, .kana = "()"},
     {.key = B_F | B_V, .kana = "!"},
     {.key = B_F | B_B, .kana = "!"},
     {.key = B_N | B_J, .kana = "?"},
-    {.key = B_H | B_J, .kana = "[]" SS_TAP(X_LEFT)},
+    {.key = B_H | B_J, .kana = "[]"},
     {.key = B_H | B_U, .kana = "/"},
 };
 
-// 内部関数の実装
+/* ------------------------------------------------------------------------
+ * 内部ヘルパー
+ * --------------------------------------------------------------------- */
 
-static void shingeta_clear(void) {
-    for (int i = 0; i < NGBUFFER; i++) {
-        ninputs[i] = 0;
-    }
-    ng_chrcount = 0;
+/* 入力状態を完全にリセットする（唯一のリセット経路） */
+static void reset_input(void) {
+    memset(ninputs, 0, sizeof(ninputs));
+    ng_chrcount  = 0;
+    keycomb      = 0;
+    timer_active = false;
 }
 
+/* combo に一致するかなを検索して送信。見つかれば true */
 static bool find_and_send_kana(uint64_t combo) {
-    shingeta_keymap bngmap;
-    for (int i = 0; i < NGMAP_SIZE; i++) {
-        memcpy_P(&bngmap, &ngmap[i], sizeof(bngmap));
-        if (combo == bngmap.key) {
-            send_string(bngmap.kana);
+    shingeta_keymap entry;
+    for (uint8_t i = 0; i < NGMAP_SIZE; i++) {
+        memcpy_P(&entry, &ngmap[i], sizeof(entry));
+        if (combo == entry.key) {
+            send_string(entry.kana);
             return true;
         }
     }
     return false;
 }
 
-static void shingeta_type_repeat(void) {
-    if (find_and_send_kana(confirmed_keycomb)) {
-        return;
-    }
-
-    for (int j = 0; j < confirmed_chrcount; j++) {
-        if (confirmed_inputs[j] >= NG_Q && confirmed_inputs[j] <= NG_SHFT) {
-            find_and_send_kana(ng_key[confirmed_inputs[j] - NG_Q]);
+/* 現在のバッファ内容を出力してリセットする。
+ * まずコンボとして検索し、なければ1キーずつ単打として出力。 */
+static void flush_input(void) {
+    if (!find_and_send_kana(keycomb)) {
+        for (uint8_t j = 0; j < ng_chrcount; j++) {
+            if (ninputs[j] >= NG_Q && ninputs[j] <= NG_SHFT) {
+                find_and_send_kana(ng_key[ninputs[j] - NG_Q]);
+            }
         }
     }
+    reset_input();
 }
 
-static void shingeta_type(void) {
-    if (find_and_send_kana(keycomb)) {
-        shingeta_clear();
-        return;
-    }
+/* keycode をバッファに登録し、1打目ならタイマーを開始する */
+static void push_input(uint16_t keycode) {
+    ninputs[ng_chrcount] = keycode;
+    ng_chrcount++;
+    keycomb |= ng_key[keycode - NG_Q];
 
-    for (int j = 0; j < ng_chrcount; j++) {
-        if (ninputs[j] >= NG_Q && ninputs[j] <= NG_SHFT) {
-            find_and_send_kana(ng_key[ninputs[j] - NG_Q]);
-        }
+    if (ng_chrcount == 1) {
+        first_key_time = timer_read();
+        timer_active   = true;
     }
-    shingeta_clear();
 }
 
-static void save_combo_state(void) {
-    combo_confirmed    = true;
-    confirmed_keycomb  = keycomb;
-    confirmed_chrcount = ng_chrcount;
-    for (int i = 0; i < ng_chrcount && i < NGBUFFER; i++) {
-        confirmed_inputs[i] = ninputs[i];
-    }
-    repeat_timer = timer_read();
+/* IME同期：日本語入力へ（Mac: かな / Win: 変換→カタカナひらがな） */
+static void ime_set_japanese(void) {
+    tap_code_delay(KC_LNG1, 10);
+    wait_ms(30);
+    tap_code_delay(KC_INT4, 10);
+    wait_ms(30);
+    // 全角英数になっていてもひらがなモードに強制復帰（Windows用）
+    tap_code_delay(KC_INT2, 10);
 }
 
-// 公開関数の実装
+/* IME同期：英数入力へ（Mac: 英数 / Win: 無変換） */
+static void ime_set_ascii(void) {
+    tap_code_delay(KC_LNG2, 10);
+    wait_ms(30);
+    tap_code_delay(KC_INT5, 10);
+}
+
+/* ------------------------------------------------------------------------
+ * 公開API
+ * --------------------------------------------------------------------- */
 
 void set_shingeta(uint8_t layer) {
     shingeta_layer = layer;
-}
-
-void shingeta_on(void) {
-    is_shingeta = true;
-    keycomb     = (uint64_t)0;
-    shingeta_clear();
-    layer_on(shingeta_layer);
-
-    tap_code(KC_LNG1);
-    tap_code(KC_INT4);
-}
-
-void shingeta_off(void) {
-    is_shingeta = false;
-    keycomb     = (uint64_t)0;
-    shingeta_clear();
-    layer_off(shingeta_layer);
-
-    tap_code(KC_LNG2);
-    tap_code(KC_INT5);
 }
 
 bool shingeta_state(void) {
     return is_shingeta;
 }
 
+void shingeta_on(void) {
+    is_shingeta = true;
+    reset_input();
+    layer_on(shingeta_layer);
+    ime_set_japanese();
+}
+
+void shingeta_off(void) {
+    is_shingeta = false;
+    reset_input();
+    layer_off(shingeta_layer);
+    ime_set_ascii();
+}
+
+/* 互換用エイリアス（旧: 状態チェックなし強制切替。現実装は同一処理） */
+void shingeta_force_on(void) {
+    shingeta_on();
+}
+
+void shingeta_force_off(void) {
+    shingeta_off();
+}
+
+/* モディファイアキーの監視。
+ * 最初のモディファイア押下でかなレイヤーを退避し、
+ * 最後のモディファイア解放で復帰する。
+ * カウンタではなく get_mods() を参照するため状態がズレない。 */
 void shingeta_mode(uint16_t keycode, keyrecord_t *record) {
-    if (!is_shingeta) return;
-
-    static uint8_t n_modifier   = 0;
-    static bool    layer_was_on = false;
-
     switch (keycode) {
         case KC_LCTL:
         case KC_LSFT:
@@ -377,89 +403,88 @@ void shingeta_mode(uint16_t keycode, keyrecord_t *record) {
         case KC_RALT:
         case KC_RGUI:
             if (record->event.pressed) {
-                if (n_modifier == 0) {
-                    // 最初のモディファイアが押された時だけレイヤーをオフ
+                /* 押下時点では自分はまだ get_mods() に反映されていない。
+                 * 他のモディファイアが無ければ「最初の1個」 */
+                if ((get_mods() & ~MOD_BIT(keycode)) == 0) {
+                    if (ng_chrcount > 0) {
+                        flush_input(); // 未確定入力を先に確定させる
+                    }
                     layer_was_on = IS_LAYER_ON(shingeta_layer);
                     if (layer_was_on) {
                         layer_off(shingeta_layer);
                     }
                 }
-                n_modifier++;
             } else {
-                n_modifier--;
-                if (n_modifier == 0) {
-                    // すべてのモディファイアが離された時にレイヤーを復元
+                /* リリース時点では自分はまだ get_mods() に残っている。
+                 * 自分を除いてゼロなら「最後の1個」 */
+                if ((get_mods() & ~MOD_BIT(keycode)) == 0) {
                     if (layer_was_on && is_shingeta) {
                         layer_on(shingeta_layer);
                     }
+                    layer_was_on = false;
                 }
             }
             break;
     }
 }
 
+/* NGキーの入力処理本体。false を返すと QMK 側の処理を止める。 */
 bool process_shingeta(uint16_t keycode, keyrecord_t *record) {
-    if (record->event.pressed) {
-        switch (keycode) {
-            case NG_Q ... NG_SHFT:
-                if (ng_chrcount >= NGBUFFER) {
-                    shingeta_clear();
-                    combo_confirmed = false;
-                    timer_active    = false;
-                }
-
-                ninputs[ng_chrcount] = keycode;
-                ng_chrcount++;
-                keycomb |= ng_key[keycode - NG_Q];
-
-                if (ng_chrcount >= 2) {
-                    timer_active = false;
-                    shingeta_type();
-                    save_combo_state();
-                } else if (ng_chrcount == 1) {
-                    shingeta_timer  = timer_read();
-                    timer_active    = true;
-                    combo_confirmed = false;
-                }
-                return false;
-                break;
-        }
-    } else {
-        switch (keycode) {
-            case NG_Q ... NG_SHFT:
-                if (ng_chrcount > 0) {
-                    timer_active = false;
-                    shingeta_type();
-                }
-
-                keycomb &= ~ng_key[keycode - NG_Q];
-
-                if (keycomb == 0) {
-                    combo_confirmed = false;
-                }
-
-                return false;
-                break;
-        }
+    /* モディファイア押下中は通常キーとして透過（Ctrl+C等のショートカット用） */
+    if (get_mods() != 0) {
+        return true;
     }
-    return true;
+
+    if (keycode < NG_Q || keycode > NG_SHFT) {
+        return true; // NGキー以外は関与しない
+    }
+
+    if (record->event.pressed) {
+        if (ng_chrcount >= NGBUFFER) {
+            reset_input(); // バッファ溢れ防止
+        }
+
+        push_input(keycode);
+
+        if (ng_chrcount == 2) {
+            uint16_t elapsed = timer_elapsed(first_key_time);
+
+            if (elapsed <= COMBO_WINDOW) {
+                /* ウィンドウ内 → 同時押しコンボとして確定 */
+                flush_input();
+            } else {
+                /* ウィンドウ外 → 1打目を単打で確定し、
+                 * 2打目を新たな1打目として仕切り直す */
+                uint16_t second = ninputs[1];
+
+                ng_chrcount = 1;
+                keycomb     = ng_key[ninputs[0] - NG_Q];
+                flush_input();
+
+                push_input(second);
+            }
+        } else if (ng_chrcount >= 3) {
+            /* 3キー同時押し（拗音など）→ 直ちに確定 */
+            flush_input();
+        }
+        return false;
+    } else {
+        /* キーリリース → 未確定分があれば確定してリセット */
+        if (ng_chrcount > 0) {
+            flush_input();
+        } else {
+            reset_input();
+        }
+        return false;
+    }
 }
 
+/* 単打確定タイマー。matrix_scan_user() から毎スキャン呼ばれる。
+ * 1打目から FIRST_OUTPUT_DELAY 経過しても2打目が来なければ単打で確定。 */
 void shingeta_timer_task(void) {
-    if (timer_active && ng_chrcount > 0) {
-        if (timer_elapsed(shingeta_timer) > FIRST_OUTPUT_DELAY) {
-            timer_active = false;
-            shingeta_type();
-            save_combo_state();
-        }
-    }
-
-    if (combo_confirmed && keycomb == confirmed_keycomb && keycomb != 0) {
-        uint16_t elapsed = timer_elapsed(repeat_timer);
-
-        if (elapsed > REPEAT_DELAY) {
-            shingeta_type_repeat();
-            repeat_timer = timer_read() - (REPEAT_DELAY - REPEAT_INTERVAL);
+    if (timer_active && ng_chrcount == 1) {
+        if (timer_elapsed(first_key_time) > FIRST_OUTPUT_DELAY) {
+            flush_input();
         }
     }
 }

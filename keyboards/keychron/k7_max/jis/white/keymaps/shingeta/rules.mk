@@ -1,3 +1,2 @@
-# This file intentionally left blank
-UNICODE_ENABLE = yes        # Unicode
+# 新下駄配列エンジンをビルド対象に追加
 SRC += shingeta.c
