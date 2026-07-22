@@ -21,8 +21,8 @@
  * 設定
  * --------------------------------------------------------------------- */
 #define NGBUFFER 5           // 入力バッファ長（同時押しは最大3キー想定）
-#define FIRST_OUTPUT_DELAY 50 // 単打確定までの待ち時間 [ms]
-#define COMBO_WINDOW 50       // 同時押し判定ウィンドウ [ms]
+#define FIRST_OUTPUT_DELAY 40 // 単打確定までの待ち時間 [ms]
+#define COMBO_WINDOW 40       // 同時押し判定ウィンドウ [ms]
 
 #define NGMAP_SIZE (sizeof(ngmap) / sizeof(shingeta_keymap))
 
